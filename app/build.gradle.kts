@@ -20,8 +20,8 @@ android {
         applicationId = "work.becode.llmquota"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
         buildConfigField("String", "CODEX_CLIENT_ID", "\"${local.getProperty("codex.clientId", "app_EMoamEEZ73f0CkXaXp7hrann")}\"")
         buildConfigField("String", "CLAUDE_CLIENT_ID", "\"${local.getProperty("claude.clientId", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")}\"")
     }
