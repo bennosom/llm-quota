@@ -50,7 +50,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -68,12 +67,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.time.Instant
 import java.time.ZoneId
 
@@ -94,19 +90,11 @@ class MainActivity : ComponentActivity() {
 private fun Dashboard(store: AccountStore) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    val fetcher = remember { QuotaFetcher(store) }
-    var accounts by remember { mutableStateOf(store.list()) }
-    val results = remember { mutableStateMapOf<String, SourceResult>() }
-    val loadingKeys = remember { mutableStateMapOf<String, Boolean>() }
-    var pulling by remember { mutableStateOf(false) }
-    var updated by remember { mutableStateOf<Instant?>(null) }
+    val vm: DashboardViewModel = viewModel { DashboardViewModel(store) }
+    // Cards that already exist when this composition starts are shown without an enter animation,
+    // so a configuration change does not replay it for every card.
+    val initialKeys = remember { vm.accounts.map { accountKey(it) }.toSet() }
     var now by remember { mutableStateOf(Instant.now()) }
-    // Cards being removed play their exit animation first; the account leaves the store afterwards.
-    val leaving = remember { mutableStateListOf<String>() }
-    var choosing by remember { mutableStateOf(false) }
-    var loginProvider by remember { mutableStateOf<String?>(null) }
-    var addingDeepSeek by remember { mutableStateOf(false) }
-    var pendingRemoval by remember { mutableStateOf<StoredAccount?>(null) }
 
     val heights = remember { mutableStateMapOf<String, Int>() }
     var draggingKey by remember { mutableStateOf<String?>(null) }
@@ -125,28 +113,6 @@ private fun Dashboard(store: AccountStore) {
         }
     }
 
-    /** Fetches one account on its own coroutine off the main thread; other rows are untouched. */
-    fun refreshOne(account: StoredAccount): Job? {
-        val k = accountKey(account)
-        if (loadingKeys[k] == true) return null
-        loadingKeys[k] = true
-        return scope.launch {
-            val result = withContext(Dispatchers.IO) { fetcher.fetch(account.provider, account.id) }
-            results[k] = result
-            loadingKeys.remove(k)
-            updated = Instant.now()
-        }
-    }
-
-    fun refreshAll(showPull: Boolean) {
-        val jobs = accounts.mapNotNull { refreshOne(it) }
-        if (showPull && jobs.isNotEmpty()) {
-            pulling = true
-            scope.launch { jobs.joinAll(); pulling = false }
-        }
-    }
-
-    LaunchedEffect(Unit) { refreshAll(showPull = false) }
     LaunchedEffect(Unit) {
         while (true) {
             now = Instant.now()
@@ -159,7 +125,7 @@ private fun Dashboard(store: AccountStore) {
         val k = draggingKey ?: return
         dragOffset += dy
         while (true) {
-            val list = accounts
+            val list = vm.accounts
             val i = list.indexOfFirst { accountKey(it) == k }
             val h = heights[k] ?: return
             fun top(index: Int) = (0 until index).sumOf { (heights[accountKey(list[it])] ?: 0) + gapPx.toDouble() }.toFloat()
@@ -170,12 +136,12 @@ private fun Dashboard(store: AccountStore) {
             val prevHeight = prev?.let { heights[accountKey(it)] }
             when {
                 nextHeight != null && center > top(i + 1) + nextHeight / 2f -> {
-                    accounts = list.toMutableList().also { it.add(i + 1, it.removeAt(i)) }
+                    vm.moveTo(list.toMutableList().also { it.add(i + 1, it.removeAt(i)) })
                     dragOffset -= nextHeight + gapPx
                     slideInto(accountKey(next!!), h + gapPx)
                 }
                 prevHeight != null && center < top(i - 1) + prevHeight / 2f -> {
-                    accounts = list.toMutableList().also { it.add(i - 1, it.removeAt(i)) }
+                    vm.moveTo(list.toMutableList().also { it.add(i - 1, it.removeAt(i)) })
                     dragOffset += prevHeight + gapPx
                     slideInto(accountKey(prev!!), -(h + gapPx))
                 }
@@ -185,17 +151,17 @@ private fun Dashboard(store: AccountStore) {
     }
 
     Column(modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Top))) {
-        DashboardHeader(onAdd = { choosing = true })
+        DashboardHeader(onAdd = { vm.choosing = true })
 
         PullToRefreshBox(
-            isRefreshing = pulling,
-            onRefresh = { refreshAll(showPull = true) },
+            isRefreshing = vm.pulling,
+            onRefresh = { vm.refreshAll(showPull = true) },
             modifier = Modifier.fillMaxSize(),
         ) {
             Column(
                 modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
             ) {
-                if (accounts.isEmpty()) {
+                if (vm.accounts.isEmpty()) {
                     Text(
                         "No accounts configured.\nAdd accounts by '+' button",
                         color = colorScheme.onSurfaceVariant,
@@ -203,19 +169,16 @@ private fun Dashboard(store: AccountStore) {
                         modifier = Modifier.fillMaxWidth().padding(top = 48.dp),
                     )
                 } else {
-                    StampLine(updated?.let { "Last updated ${formatStamp(it, now, ZoneId.systemDefault())}" } ?: "loading…")
+                    StampLine(vm.updated?.let { "Last updated ${formatStamp(it, now, ZoneId.systemDefault())}" } ?: "loading…")
                 }
-                accounts.forEach { account ->
+                vm.accounts.forEach { account ->
                     val k = accountKey(account)
                     androidx.compose.runtime.key(k) {
-                        val visible = remember { MutableTransitionState(false) }
-                        visible.targetState = k !in leaving
-                        LaunchedEffect(k in leaving, visible.currentState) {
-                            if (k in leaving && !visible.currentState) {
-                                store.remove(account.provider, account.id)
-                                accounts = store.list()
-                                results.remove(k)
-                                leaving.remove(k)
+                        val visible = remember { MutableTransitionState(k in initialKeys) }
+                        visible.targetState = k !in vm.leaving
+                        LaunchedEffect(k in vm.leaving, visible.currentState) {
+                            if (k in vm.leaving && !visible.currentState) {
+                                vm.finishRemoval(account)
                             }
                         }
                         AnimatedVisibility(
@@ -226,21 +189,21 @@ private fun Dashboard(store: AccountStore) {
                             Box(Modifier.padding(bottom = CARD_GAP)) {
                                 AccountCard(
                                     account = account,
-                                    result = results[k],
-                                    loading = loadingKeys[k] == true,
+                                    result = vm.results[k],
+                                    loading = vm.isLoading(k),
                                     dragging = draggingKey == k,
                                     now = now,
                                     dragOffset = dragOffset,
                                     shift = { shiftOf(k).value },
                                     onHeight = { heights[k] = it },
                                     onOpenUsage = { openInBrowser(context, usageUrl(account.provider)) },
-                                    onRefresh = { refreshOne(account) },
-                                    onDeleteRequest = { pendingRemoval = account },
+                                    onRefresh = { vm.refreshOne(account) },
+                                    onDeleteRequest = { vm.pendingRemoval = account },
                                     onDragStart = { if (draggingKey == null) { draggingKey = k; dragOffset = 0f } },
                                     onDragBy = { dragBy(it) },
                                     onDragEnd = {
                                         if (draggingKey == k) {
-                                            store.reorder(accounts.map { accountKey(it) })
+                                            vm.saveOrder()
                                             scope.launch {
                                                 Animatable(dragOffset).animateTo(0f, spring(stiffness = Spring.StiffnessMediumLow)) { dragOffset = value }
                                                 draggingKey = null
@@ -257,62 +220,57 @@ private fun Dashboard(store: AccountStore) {
         }
     }
 
-    if (choosing) {
+    if (vm.choosing) {
         AlertDialog(
-            onDismissRequest = { choosing = false },
+            onDismissRequest = { vm.choosing = false },
             containerColor = colorScheme.surface,
             title = { Text("Add account", fontWeight = FontWeight.SemiBold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    TextButton(onClick = { choosing = false; loginProvider = CODEX }) { Text("Codex · browser sign-in") }
-                    TextButton(onClick = { choosing = false; loginProvider = CLAUDE }) { Text("Claude · browser sign-in") }
-                    TextButton(onClick = { choosing = false; addingDeepSeek = true }) { Text("DeepSeek · API key") }
+                    TextButton(onClick = { vm.choosing = false; vm.loginProvider = CODEX }) { Text("Codex · browser sign-in") }
+                    TextButton(onClick = { vm.choosing = false; vm.loginProvider = CLAUDE }) { Text("Claude · browser sign-in") }
+                    TextButton(onClick = { vm.choosing = false; vm.addingDeepSeek = true }) { Text("DeepSeek · API key") }
                 }
             },
             confirmButton = {},
-            dismissButton = { TextButton(onClick = { choosing = false }) { Text("Cancel") } },
+            dismissButton = { TextButton(onClick = { vm.choosing = false }) { Text("Cancel") } },
         )
     }
 
-    loginProvider?.let { provider ->
+    vm.loginProvider?.let { provider ->
         OAuthLoginDialog(
             title = if (provider == CODEX) "Add Codex" else "Add Claude",
             start = { if (provider == CODEX) CodexLogin.start() else ClaudeLogin.start() },
-            onDismiss = { loginProvider = null },
+            onDismiss = { vm.loginProvider = null },
             onAdded = { account ->
-                store.upsert(account)
-                accounts = store.list()
-                loginProvider = null
-                refreshOne(account)
+                vm.addAccount(account)
+                vm.loginProvider = null
             },
         )
     }
 
-    if (addingDeepSeek) {
+    if (vm.addingDeepSeek) {
         AddDeepSeekDialog(
-            onDismiss = { addingDeepSeek = false },
+            onDismiss = { vm.addingDeepSeek = false },
             onAdded = { account ->
-                store.upsert(account)
-                accounts = store.list()
-                addingDeepSeek = false
-                refreshOne(account)
+                vm.addAccount(account)
+                vm.addingDeepSeek = false
             },
         )
     }
 
-    pendingRemoval?.let { account ->
+    vm.pendingRemoval?.let { account ->
         AlertDialog(
-            onDismissRequest = { pendingRemoval = null },
+            onDismissRequest = { vm.pendingRemoval = null },
             containerColor = colorScheme.surface,
             title = { Text("Remove account?", fontWeight = FontWeight.SemiBold) },
             text = { Text("${providerName(account.provider)} · ${displayLabel(account)}", fontSize = 13.sp) },
             confirmButton = {
                 TextButton(onClick = {
-                    leaving.add(accountKey(account))
-                    pendingRemoval = null
+                    vm.confirmRemoval(account)
                 }) { Text("Remove", color = colorScheme.error) }
             },
-            dismissButton = { TextButton(onClick = { pendingRemoval = null }) { Text("Cancel") } },
+            dismissButton = { TextButton(onClick = { vm.pendingRemoval = null }) { Text("Cancel") } },
         )
     }
 }
